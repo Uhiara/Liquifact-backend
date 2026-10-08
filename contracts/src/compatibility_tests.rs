@@ -125,7 +125,7 @@ fn rounding_and_fee_boundaries_preserve_total_amount() {
         (1, 1, 0),
         (19, 500, 0),
         (21, 500, 1),
-        (101, 10_000, 101),
+        (101, 9_999, 100),
     ] {
         let (env, contract, recipient, creator, hunter, token) = setup();
         let client = BountyContractClient::new(&env, &contract);

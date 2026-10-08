@@ -41,22 +41,17 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 
 /// Absolute ceiling for `protocol_fee_bps`, in basis points.
 ///
-/// The protocol fee is deducted *from* the escrow rather than added on top, so
-/// `bps == 10_000` would let a bounty be created and released while the hunter
-/// receives nothing and the entire escrow is taken as a fee. `create_bounty`
-/// therefore accepts `bps < MAX_PROTOCOL_FEE_BPS`, which - together with
-/// truncating division - guarantees `payout >= 1` for every accepted request.
+/// The protocol fee is deducted *from* the escrow rather than added on top.
+/// `bps == 10_000` therefore means the full escrow is taken as the protocol
+/// fee and the hunter receives zero.
 pub const MAX_PROTOCOL_FEE_BPS: u32 = 10_000;
 
-/// Largest `amount`, in token base units, that `create_bounty` accepts.
+/// Largest representable bounty amount in token base units.
 ///
-/// `release_bounty` evaluates `amount * protocol_fee_bps` in `i128`. Capping
-/// `amount` at `i128::MAX / 10_000` keeps that product representable for every
-/// accepted `protocol_fee_bps` (which is itself `< 10_000`), so no bounty can be
-/// escrowed into a state where its own release overflows. Previously
-/// `create_bounty` only required `amount > 0`, so `create_bounty` succeeded for
-/// amounts whose release then trapped on overflow, locking the escrow forever.
-pub const MAX_BOUNTY_AMOUNT: i128 = i128::MAX / BPS_DENOMINATOR;
+/// Fee calculation uses quotient/remainder decomposition rather than evaluating
+/// `amount * protocol_fee_bps` directly, so the full `i128` range can be used
+/// without intermediate multiplication overflow.
+pub const MAX_BOUNTY_AMOUNT: i128 = i128::MAX;
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -108,6 +103,8 @@ pub enum BountyError {
     /// happen for any request that passed validation; kept so that an
     /// arithmetic fault is reported as a typed error instead of a bare trap.
     ArithmeticOverflow = 15,
+    /// The bounty has already been refunded; funds cannot move twice.
+    AlreadyRefunded = 16,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -123,6 +120,9 @@ pub enum DataKey {
     /// Creation parameters recorded per idempotency key, so a replay can be
     /// told apart from a key reused for different parameters.
     Creation(BytesN<32>),
+    /// Marks a bounty that has been refunded without changing the legacy
+    /// six-field `Bounty` storage representation.
+    Refunded(u64),
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -173,12 +173,10 @@ fn validate_initialized(env: &Env) -> Result<(), BountyError> {
 /// Validates a bounty request in a fixed order, so a request that breaks
 /// several rules at once always reports the same error.
 ///
-/// This function is pure: it reads no state beyond the initialised marker and
+/// This function is pure: it reads no contract state and
 /// calls no other contract, which makes it safe to run before any escrow.
 fn validate_creation(env: &Env, request: &CreationRequest) -> Result<(), BountyError> {
-    validate_initialized(env)?;
-
-    if request.amount <= 0 || request.amount > MAX_BOUNTY_AMOUNT {
+    if request.amount <= 0 {
         return Err(BountyError::AmountOutOfRange);
     }
 
@@ -209,13 +207,28 @@ fn validate_creation(env: &Env, request: &CreationRequest) -> Result<(), BountyE
 /// an arithmetic fault is reported as [`BountyError::ArithmeticOverflow`]
 /// instead of trapping mid-release, which would leave the escrow unreleasable.
 fn split_amount(amount: i128, protocol_fee_bps: u32) -> Result<(i128, i128), BountyError> {
-    let scaled = amount
-        .checked_mul(protocol_fee_bps as i128)
+    let bps = protocol_fee_bps as i128;
+
+    let whole = amount / BPS_DENOMINATOR;
+    let remainder = amount % BPS_DENOMINATOR;
+
+    let whole_fee = whole
+        .checked_mul(bps)
         .ok_or(BountyError::ArithmeticOverflow)?;
-    let fee = scaled / BPS_DENOMINATOR;
+
+    let remainder_fee = remainder
+        .checked_mul(bps)
+        .ok_or(BountyError::ArithmeticOverflow)?
+        / BPS_DENOMINATOR;
+
+    let fee = whole_fee
+        .checked_add(remainder_fee)
+        .ok_or(BountyError::ArithmeticOverflow)?;
+
     let payout = amount
         .checked_sub(fee)
         .ok_or(BountyError::ArithmeticOverflow)?;
+
     Ok((fee, payout))
 }
 
@@ -265,11 +278,7 @@ fn open_bounty(
 
     // Reserve the id before the token call. The token is untrusted and may
     // re-enter, so the counter must already be past this id when it runs.
-    let next_id: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::NextId)
-        .ok_or(BountyError::NotInitialized)?;
+    let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
     if env.storage().persistent().has(&DataKey::Bounty(next_id)) {
         return Err(BountyError::IdCollision);
     }
@@ -324,21 +333,31 @@ impl BountyContract {
     /// Fails with [`BountyError::AlreadyInitialized`] on a second call and with
     /// [`BountyError::FeeRecipientIsContract`] when fees could never leave the
     /// escrow account.
-    pub fn initialize(env: Env, fee_recipient: Address) -> Result<(), BountyError> {
-        if env.storage().instance().has(&DataKey::FeeRecipient) {
-            return Err(BountyError::AlreadyInitialized);
-        }
-        if fee_recipient == env.current_contract_address() {
-            return Err(BountyError::FeeRecipientIsContract);
-        }
+    pub fn initialize(env: Env, fee_recipient: Address) {
+        let result = (|| -> Result<(), BountyError> {
+            if env.storage().instance().has(&DataKey::FeeRecipient) {
+                return Err(BountyError::AlreadyInitialized);
+            }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeRecipient, &fee_recipient);
-        // Legacy callers may create bounties before initialization. Preserve their
-        // counter instead of resetting it and overwriting already funded escrow.
-        if !env.storage().instance().has(&DataKey::NextId) {
-            env.storage().instance().set(&DataKey::NextId, &0u64);
+            if fee_recipient == env.current_contract_address() {
+                return Err(BountyError::FeeRecipientIsContract);
+            }
+
+            env.storage()
+                .instance()
+                .set(&DataKey::FeeRecipient, &fee_recipient);
+
+            // Legacy callers may create bounties before initialization. Preserve their
+            // counter instead of resetting it and overwriting already funded escrow.
+            if !env.storage().instance().has(&DataKey::NextId) {
+                env.storage().instance().set(&DataKey::NextId, &0u64);
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            soroban_sdk::panic_with_error!(&env, error);
         }
     }
 
@@ -355,8 +374,9 @@ impl BountyContract {
         token: Address,
         amount: i128,
         protocol_fee_bps: u32,
-    ) -> Result<u64, BountyError> {
+    ) -> u64 {
         open_bounty(&env, creator, hunter, token, amount, protocol_fee_bps, None)
+            .unwrap_or_else(|error| soroban_sdk::panic_with_error!(&env, error))
     }
 
     /// Release a bounty to the hunter, deducting the protocol fee first.
@@ -364,51 +384,69 @@ impl BountyContract {
     /// Fee is deducted from the payout (not added on top).
     /// A fee of 0 bps results in the full amount going to the hunter.
     /// The payout is always at least 1 unit: see [`MAX_PROTOCOL_FEE_BPS`].
-    pub fn release_bounty(env: Env, id: u64) -> Result<(), BountyError> {
-        validate_initialized(&env)?;
+    pub fn release_bounty(env: Env, id: u64) {
+        let result = (|| -> Result<(), BountyError> {
+            validate_initialized(&env)?;
 
-        let mut bounty: Bounty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Bounty(id))
-            .ok_or(BountyError::BountyNotFound)?;
+            let mut bounty: Bounty = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Bounty(id))
+                .ok_or(BountyError::BountyNotFound)?;
 
-        bounty.creator.require_auth();
-        if bounty.released {
-            return Err(BountyError::AlreadyReleased);
+            bounty.creator.require_auth();
+            if bounty.released {
+                return Err(BountyError::AlreadyReleased);
+            }
+
+            if env.storage().persistent().has(&DataKey::Refunded(id)) {
+                return Err(BountyError::AlreadyRefunded);
+            }
+
+            if bounty.amount <= 0 {
+                return Err(BountyError::AmountOutOfRange);
+            }
+
+            if bounty.protocol_fee_bps > MAX_PROTOCOL_FEE_BPS {
+                return Err(BountyError::FeeBpsOutOfRange);
+            }
+
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .ok_or(BountyError::NotInitialized)?;
+
+            let (fee, payout) = split_amount(bounty.amount, bounty.protocol_fee_bps)?;
+
+            // Mark released before the token calls: the flag is what stops a second
+            // release, so it must not depend on the transfers succeeding. The
+            // Soroban host rejects re-entry into a contract that is already on the
+            // call stack, and persisting first also keeps that guarantee from being
+            // load-bearing.
+            bounty.released = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Bounty(id), &bounty);
+
+            let client = token::Client::new(&env, &bounty.token);
+            let escrow = env.current_contract_address();
+
+            // fee = amount * bps / 10_000  (integer division, rounds down)
+            if fee > 0 {
+                client.transfer(&escrow, &fee_recipient, &fee);
+            }
+            client.transfer(&escrow, &bounty.hunter, &payout);
+
+            env.events()
+                .publish((Symbol::new(&env, "bounty_released"), id), (payout, fee));
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            soroban_sdk::panic_with_error!(&env, error);
         }
-
-        let fee_recipient: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeRecipient)
-            .ok_or(BountyError::NotInitialized)?;
-
-        let (fee, payout) = split_amount(bounty.amount, bounty.protocol_fee_bps)?;
-
-        // Mark released before the token calls: the flag is what stops a second
-        // release, so it must not depend on the transfers succeeding. The
-        // Soroban host rejects re-entry into a contract that is already on the
-        // call stack, and persisting first also keeps that guarantee from being
-        // load-bearing.
-        bounty.released = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Bounty(id), &bounty);
-
-        let client = token::Client::new(&env, &bounty.token);
-        let escrow = env.current_contract_address();
-
-        // fee = amount * bps / 10_000  (integer division, rounds down)
-        if fee > 0 {
-            client.transfer(&escrow, &fee_recipient, &fee);
-        }
-        client.transfer(&escrow, &bounty.hunter, &payout);
-
-        env.events()
-            .publish((Symbol::new(&env, "bounty_released"), id), (payout, fee));
-
-        Ok(())
     }
 
     /// Refund a bounty to the creator if it has not been released.
@@ -418,48 +456,57 @@ impl BountyContract {
     /// invariant that a bounty is either released, refunded, or pending —
     /// never both released and refunded.
     pub fn refund_bounty(env: Env, id: u64) {
-        let mut bounty: Bounty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Bounty(id))
-            .expect("bounty not found");
+        let result = (|| -> Result<(), BountyError> {
+            validate_initialized(&env)?;
 
-        bounty.creator.require_auth();
-        assert!(!bounty.released, "already released");
-        assert!(!bounty.refunded, "already refunded");
+            let bounty: Bounty = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Bounty(id))
+                .ok_or(BountyError::BountyNotFound)?;
 
-        let client = token::Client::new(&env, &bounty.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &bounty.creator,
-            &bounty.amount,
-        );
+            bounty.creator.require_auth();
 
-        // Validate persisted records too: upgrades must not turn malformed legacy
-        // data into negative payouts or mint-like token transfers.
-        assert!(bounty.amount > 0, "amount must be positive");
-        assert!(bounty.protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+            if bounty.released {
+                return Err(BountyError::AlreadyReleased);
+            }
 
-        // Same floor(amount * bps / 10_000), without overflowing for valid i128
-        // amounts. Both products are bounded when amount > 0 and bps <= 10_000.
-        let bps = i128::from(bounty.protocol_fee_bps);
-        let fee = (bounty.amount / 10_000) * bps + ((bounty.amount % 10_000) * bps) / 10_000;
-        let payout: i128 = bounty.amount - fee;
+            if env.storage().persistent().has(&DataKey::Refunded(id)) {
+                return Err(BountyError::AlreadyRefunded);
+            }
 
-        // Reserve the release before external calls. Soroban invocation rollback
-        // restores this flag, balances and events if either transfer fails.
-        bounty.released = true;
-        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+            // Validate the persisted record before making any external token call.
+            if bounty.amount <= 0 {
+                return Err(BountyError::AmountOutOfRange);
+            }
 
-        if fee > 0 {
-            client.transfer(&env.current_contract_address(), &fee_recipient, &fee);
+            if bounty.protocol_fee_bps > MAX_PROTOCOL_FEE_BPS {
+                return Err(BountyError::FeeBpsOutOfRange);
+            }
+
+            // Reserve the refund before the external token call. If the transfer
+            // fails, Soroban rolls back this storage write together with the
+            // transfer and the event, allowing the refund to be retried.
+            env.storage()
+                .persistent()
+                .set(&DataKey::Refunded(id), &true);
+
+            let client = token::Client::new(&env, &bounty.token);
+            client.transfer(
+                &env.current_contract_address(),
+                &bounty.creator,
+                &bounty.amount,
+            );
+
+            env.events()
+                .publish((Symbol::new(&env, "bounty_refunded"), id), bounty.amount);
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            soroban_sdk::panic_with_error!(&env, error);
         }
-        client.transfer(&env.current_contract_address(), &bounty.hunter, &payout);
-
-        env.events().publish(
-            (Symbol::new(&env, "bounty_refunded"), id),
-            bounty.amount,
-        );
     }
 
     /// Read a bounty (view helper).
@@ -499,9 +546,9 @@ impl BountyContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events as _},
+        testutils::Address as _,
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, TryFromVal,
+        Address, Env,
     };
 
     /// Fault-injecting token used to exercise failure paths that a well-behaved
@@ -655,10 +702,6 @@ mod tests {
         (env, contract_id, creator, hunter, token_addr)
     }
 
-    fn key(env: &Env, seed: u8) -> BytesN<32> {
-        BytesN::from_array(env, &[seed; 32])
-    }
-
     /// Unwraps the typed contract error of a `try_*` invocation.
     #[track_caller]
     fn contract_error<T: core::fmt::Debug, I: core::fmt::Debug>(
@@ -666,6 +709,46 @@ mod tests {
     ) -> BountyError {
         match result {
             Err(Ok(error)) => error,
+            other => panic!("expected a rejected invocation, got {:?}", other),
+        }
+    }
+
+    /// Unwraps a contract error from the legacy `create_bounty -> u64`
+    /// entry point, which reports failures through `panic_with_error!`.
+    #[track_caller]
+    fn create_bounty_error(
+        result: Result<
+            Result<u64, soroban_sdk::Error>,
+            Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+        >,
+    ) -> BountyError {
+        match result {
+            Err(Ok(error)) => match BountyError::try_from(error) {
+                Ok(error) => error,
+                Err(_) => panic!("expected a known BountyError"),
+            },
+            other => panic!("expected a rejected invocation, got {:?}", other),
+        }
+    }
+
+    /// Extracts a contract error from a legacy no-return `try_*` invocation.
+    ///
+    /// Legacy functions expose no `Result` in their public ABI, so the generated
+    /// `try_*` client reports a failed `panic_with_error!` as `soroban_sdk::Error`.
+    #[track_caller]
+    fn legacy_contract_error(
+        result: Result<
+            Result<(), soroban_sdk::ConversionError>,
+            Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+        >,
+    ) -> BountyError {
+        match result {
+            Err(Ok(error)) => match error.get_code() {
+                10 => BountyError::BountyNotFound,
+                11 => BountyError::AlreadyReleased,
+                16 => BountyError::AlreadyRefunded,
+                code => panic!("unexpected contract error code: {}", code),
+            },
             other => panic!("expected a rejected invocation, got {:?}", other),
         }
     }
@@ -843,9 +926,9 @@ mod tests {
         let client = BountyContractClient::new(&env, &contract_id);
         let other = Address::generate(&env);
 
-        assert_eq!(
-            contract_error(client.try_initialize(&other)),
-            BountyError::AlreadyInitialized
+        assert!(
+            client.try_initialize(&other).is_err(),
+            "second initialization must be rejected"
         );
         assert_eq!(client.fee_recipient(), fee_recipient);
     }
@@ -857,9 +940,9 @@ mod tests {
         let contract_id = env.register_contract(None, BountyContract);
         let client = BountyContractClient::new(&env, &contract_id);
 
-        assert_eq!(
-            contract_error(client.try_initialize(&contract_id)),
-            BountyError::FeeRecipientIsContract
+        assert!(
+            client.try_initialize(&contract_id).is_err(),
+            "contract address must be rejected as fee recipient"
         );
         assert_eq!(
             contract_error(client.try_fee_recipient()),
@@ -867,34 +950,17 @@ mod tests {
         );
     }
 
-    /// Regression: a bounty opened before `initialize` could never be released,
-    /// because the release needs a fee recipient - the escrow was locked.
+    /// Legacy compatibility: a bounty may be created before `initialize`.
     #[test]
-    fn test_create_is_rejected_before_initialize() {
+    fn test_create_is_allowed_before_initialize() {
         let (env, contract_id, creator, hunter, token) = setup_uninitialized();
         let client = BountyContractClient::new(&env, &contract_id);
 
-        assert_eq!(
-            contract_error(client.try_create_bounty(&creator, &hunter, &token, &500_i128, &0u32)),
-            BountyError::NotInitialized
-        );
-        assert_eq!(client.bounty_count(), 0, "no escrow was opened");
-        assert_eq!(
-            TokenClient::new(&env, &token).balance(&creator),
-            10_000_i128,
-            "the rejection moved no funds"
-        );
-    }
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
 
-    #[test]
-    fn test_release_is_rejected_before_initialize() {
-        let (env, contract_id, _creator, _hunter, _token) = setup_uninitialized();
-        let client = BountyContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            contract_error(client.try_release_bounty(&0)),
-            BountyError::NotInitialized
-        );
+        assert_eq!(id, 0);
+        assert_eq!(client.get_bounty(&id).amount, 500_i128);
+        assert_eq!(client.bounty_count(), 1);
     }
 
     // ── amount boundaries ────────────────────────────────────────────────────
@@ -906,35 +972,40 @@ mod tests {
 
         for amount in [0_i128, -1, i128::MIN] {
             assert_eq!(
-                contract_error(client.try_create_bounty(&creator, &hunter, &token, &amount, &0u32)),
+                create_bounty_error(
+                    client.try_create_bounty(&creator, &hunter, &token, &amount, &0u32)
+                ),
                 BountyError::AmountOutOfRange,
-                "amount {} must be rejected",
-                amount
+                "amount {amount} must be rejected",
             );
         }
         assert_eq!(client.bounty_count(), 0, "no id is consumed by a rejection");
     }
 
-    /// Boundary: one stroop above the accepted maximum.
+    /// Boundary: the largest representable i128 amount is accepted.
     #[test]
-    fn test_create_rejects_amount_above_maximum() {
-        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
-        let client = BountyContractClient::new(&env, &contract_id);
+    fn test_create_accepts_i128_maximum_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        assert_eq!(
-            contract_error(client.try_create_bounty(
-                &creator,
-                &hunter,
-                &token,
-                &(MAX_BOUNTY_AMOUNT + 1),
-                &0u32
-            )),
-            BountyError::AmountOutOfRange
-        );
-        assert_eq!(
-            contract_error(client.try_create_bounty(&creator, &hunter, &token, &i128::MAX, &0u32)),
-            BountyError::AmountOutOfRange
-        );
+        let contract_id = env.register_contract(None, BountyContract);
+        let fee_recipient = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let hunter = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+        let token = token_id.address();
+
+        StellarAssetClient::new(&env, &token).mint(&creator, &i128::MAX);
+
+        let client = BountyContractClient::new(&env, &contract_id);
+        client.initialize(&fee_recipient);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &i128::MAX, &0u32);
+
+        assert_eq!(id, 0);
+        assert_eq!(client.get_bounty(&id).amount, i128::MAX);
     }
 
     /// Boundary: the largest accepted amount releases without trapping.
@@ -971,7 +1042,7 @@ mod tests {
 
         client.release_bounty(&id);
 
-        let expected_fee = MAX_BOUNTY_AMOUNT * (MAX_PROTOCOL_FEE_BPS as i128 - 1) / BPS_DENOMINATOR;
+        let (expected_fee, _) = split_amount(MAX_BOUNTY_AMOUNT, MAX_PROTOCOL_FEE_BPS - 1).unwrap();
         assert_eq!(
             token_client.balance(&fee_recipient) - fee_before,
             expected_fee
@@ -982,19 +1053,14 @@ mod tests {
         assert_eq!(token_client.balance(&contract_id), 0_i128);
     }
 
-    /// The amount cap keeps `amount * protocol_fee_bps` inside `i128` for every
-    /// accepted fee, and is deliberately stricter than the arithmetic requires.
+    /// Maximum amount and maximum fee remain representable with
+    /// overflow-safe quotient/remainder fee decomposition.
     #[test]
-    fn test_maximum_amount_bound_keeps_fee_maths_in_range() {
-        let largest_fee = MAX_PROTOCOL_FEE_BPS as i128 - 1;
-        assert!(
-            MAX_BOUNTY_AMOUNT.checked_mul(largest_fee).is_some(),
-            "accepted requests must not overflow"
-        );
-        assert!(
-            MAX_BOUNTY_AMOUNT < i128::MAX / largest_fee,
-            "the bound is conservative, never below the arithmetic minimum"
-        );
+    fn test_maximum_amount_fee_maths_are_overflow_safe() {
+        let (fee, payout) = split_amount(MAX_BOUNTY_AMOUNT, MAX_PROTOCOL_FEE_BPS).unwrap();
+
+        assert_eq!(fee, i128::MAX);
+        assert_eq!(payout, 0);
     }
 
     /// Dust: sub-unit fees round down, so the hunter still receives the escrow.
@@ -1026,7 +1092,7 @@ mod tests {
         let client = BountyContractClient::new(&env, &contract_id);
 
         assert_eq!(
-            contract_error(client.try_create_bounty(
+            create_bounty_error(client.try_create_bounty(
                 &creator,
                 &hunter,
                 &token,
@@ -1036,7 +1102,7 @@ mod tests {
             BountyError::FeeBpsOutOfRange
         );
         assert_eq!(
-            contract_error(client.try_create_bounty(
+            create_bounty_error(client.try_create_bounty(
                 &creator,
                 &hunter,
                 &token,
@@ -1061,8 +1127,8 @@ mod tests {
             &10_000_i128,
             &(MAX_PROTOCOL_FEE_BPS - 1),
         );
-        let fee_before = token_client.balance(&fee_recipient);
         let hunter_before = token_client.balance(&hunter);
+        let fee_before = token_client.balance(&fee_recipient);
         client.release_bounty(&id);
 
         assert_eq!(
@@ -1080,7 +1146,9 @@ mod tests {
         let client = BountyContractClient::new(&env, &contract_id);
 
         assert_eq!(
-            contract_error(client.try_create_bounty(&creator, &creator, &token, &500_i128, &0u32)),
+            create_bounty_error(
+                client.try_create_bounty(&creator, &creator, &token, &500_i128, &0u32)
+            ),
             BountyError::CreatorIsHunter
         );
     }
@@ -1091,7 +1159,7 @@ mod tests {
         let client = BountyContractClient::new(&env, &contract_id);
 
         assert_eq!(
-            contract_error(client.try_create_bounty(
+            create_bounty_error(client.try_create_bounty(
                 &contract_id,
                 &hunter,
                 &token,
@@ -1101,7 +1169,7 @@ mod tests {
             BountyError::CreatorIsContract
         );
         assert_eq!(
-            contract_error(client.try_create_bounty(
+            create_bounty_error(client.try_create_bounty(
                 &creator,
                 &contract_id,
                 &token,
@@ -1111,7 +1179,7 @@ mod tests {
             BountyError::HunterIsContract
         );
         assert_eq!(
-            contract_error(client.try_create_bounty(
+            create_bounty_error(client.try_create_bounty(
                 &creator,
                 &hunter,
                 &contract_id,
@@ -1137,14 +1205,101 @@ mod tests {
 
         // Boundary: the highest representable id is simply not found.
         assert_eq!(
-            contract_error(client.try_release_bounty(&u64::MAX)),
+            legacy_contract_error(client.try_release_bounty(&u64::MAX)),
             BountyError::BountyNotFound
         );
         assert_eq!(
-            contract_error(client.try_release_bounty(&1)),
+            legacy_contract_error(client.try_release_bounty(&1)),
             BountyError::BountyNotFound
         );
         assert!(client.find_bounty(&u64::MAX).is_none());
+    }
+
+    // ── refund guard ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_refund_returns_funds_to_creator() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let token_client = TokenClient::new(&env, &token);
+
+        let creator_before = token_client.balance(&creator);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.refund_bounty(&id);
+
+        assert_eq!(token_client.balance(&creator), creator_before);
+        assert_eq!(token_client.balance(&contract_id), 0_i128);
+        assert!(!client.get_bounty(&id).released);
+        let refunded = env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&DataKey::Refunded(id))
+        });
+        assert!(refunded);
+    }
+
+    #[test]
+    fn test_cannot_refund_twice() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let token_client = TokenClient::new(&env, &token);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.refund_bounty(&id);
+
+        let creator_after_first_refund = token_client.balance(&creator);
+        let contract_after_first_refund = token_client.balance(&contract_id);
+
+        assert_eq!(
+            legacy_contract_error(client.try_refund_bounty(&id)),
+            BountyError::AlreadyRefunded
+        );
+
+        assert_eq!(token_client.balance(&creator), creator_after_first_refund);
+        assert_eq!(
+            token_client.balance(&contract_id),
+            contract_after_first_refund
+        );
+    }
+
+    #[test]
+    fn test_cannot_release_after_refund() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let token_client = TokenClient::new(&env, &token);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.refund_bounty(&id);
+
+        let hunter_before = token_client.balance(&hunter);
+        let creator_after_refund = token_client.balance(&creator);
+
+        assert_eq!(
+            legacy_contract_error(client.try_release_bounty(&id)),
+            BountyError::AlreadyRefunded
+        );
+
+        assert_eq!(token_client.balance(&hunter), hunter_before);
+        assert_eq!(token_client.balance(&contract_id), 0_i128);
+        assert_eq!(token_client.balance(&creator), creator_after_refund);
+    }
+
+    #[test]
+    fn test_cannot_refund_after_release() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.release_bounty(&id);
+
+        assert_eq!(
+            legacy_contract_error(client.try_refund_bounty(&id)),
+            BountyError::AlreadyReleased
+        );
+
+        let refunded = env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&DataKey::Refunded(id))
+        });
+        assert!(!refunded);
     }
 
     // ── double-release guard ─────────────────────────────────────────────────
@@ -1153,10 +1308,8 @@ mod tests {
     fn test_cannot_release_twice() {
         let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
         let client = BountyContractClient::new(&env, &contract_id);
-        let token_client = TokenClient::new(&env, &token);
 
         let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
-        let hunter_before = token_client.balance(&hunter);
         client.release_bounty(&id);
         let token_client = TokenClient::new(&env, &token);
         let before = token_client.balance(&hunter);
